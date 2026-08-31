@@ -1,26 +1,31 @@
 import os
 import json
 import uuid
+import asyncio
 from typing import AsyncGenerator, Dict, Any, List, Optional
-from datetime import datetime
-from openai import AsyncOpenAI
+from openai import AsyncAzureOpenAI
+from dotenv import load_dotenv
 
 from backend.services.retriever import HybridRetrievalEngine
-from backend.agents.sql_agent import PostgresSQLAgent  # Updated import to Postgres
+from backend.agents.sql_agent import PostgresSQLAgent
 
+# Load environment variables
+load_dotenv()
+
+# In-memory chat history
 SESSION_STORE: Dict[str, Dict[str, Any]] = {}
 
-# Fetch configurations from environment variables to prevent hardcoding
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "qwen2.5-14b-instruct-1m")
-FALLBACK_THRESHOLD = float(os.getenv("CHROMA_FALLBACK_THRESHOLD", "0.05"))
+# Use Azure Deployment Name as the model
+DEFAULT_MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
-llm_client = AsyncOpenAI(
-    base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:1234/v1"),
-    api_key=os.getenv("LLM_API_KEY", "lm-studio"),
+# Initialize Azure OpenAI Client (Zero Hardcoding)
+llm_client = AsyncAzureOpenAI(
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
     timeout=180.0
 )
 
-# Initialize engines
 retrieval_engine = HybridRetrievalEngine()
 sql_agent = PostgresSQLAgent()
 
@@ -29,81 +34,92 @@ async def stream_chat_response(
     query: str,
     session_id: Optional[str] = None,
     history: Optional[List[Dict[str, str]]] = None,
-    top_k: int = 6,
+    top_k: int = 5,
     model: str = DEFAULT_MODEL
 ) -> AsyncGenerator[str, None]:
-    """
-    Retrieves information dynamically.
-    Checks ChromaDB first. If confidence is low, falls back to PostgreSQL.
-    Never touches, reads, or reloads raw source files during chat.
-    """
+    
     clean_query = query.strip()
     session_id = session_id or str(uuid.uuid4())
 
     if session_id not in SESSION_STORE:
-        SESSION_STORE[session_id] = {
-            "session_id": session_id,
-            "created_at": datetime.now().isoformat(),
-            "messages": []
-        }
+        SESSION_STORE[session_id] = {"session_id": session_id, "messages": []}
 
-    # 1. First, retrieve unstructured data from ChromaDB
-    retrieved_docs = retrieval_engine.retrieve(clean_query, strategy="hybrid_rerank", top_k=top_k)
+    print(f"[INFO] 🚀 Dynamic Parallel Retrieval Started for: '{clean_query}'")
+
+    # =========================================================================
+    # ZERO ROUTING / ZERO HARDCODING: Query both engines concurrently
+    # =========================================================================
+    async def fetch_db():
+        print("[INFO] Checking PostgreSQL...")
+        return await sql_agent.execute_query(clean_query, llm_client, model)
+
+    async def fetch_docs():
+        print("[INFO] Checking ChromaDB...")
+        return await asyncio.to_thread(
+            retrieval_engine.retrieve, 
+            clean_query, 
+            strategy="hybrid_rerank", 
+            top_k=top_k
+        )
+
+    # Execute both searches concurrently
+    db_results, retrieved_docs = await asyncio.gather(fetch_db(), fetch_docs())
+
+    # =========================================================================
+    # CONTEXT STRUCTURING: Map explicitly to System Prompt definitions
+    # =========================================================================
     
-    unstructured_context: List[str] = []
-    max_score = 0.0
+    # 1. Format Database Records
+    db_context_str = "\n".join(db_results).strip() if db_results else ""
+
+    # 2. Format Document Text Chunks
+    doc_blocks = []
+    for d in retrieved_docs:
+        doc_name = d.get("metadata", {}).get("filename", "Document")
+        page_no = d.get("metadata", {}).get("page_number", "")
+        page_str = f" (Page {page_no})" if page_no else ""
+        content = d.get("content", "").strip()
+        if content:
+            doc_blocks.append(f"[{doc_name}{page_str}]\n{content}")
     
-    for doc in retrieved_docs:
-        # Dynamically extract score regardless of metadata structure
-        score = doc.get("score") or doc.get("metadata", {}).get("score", 0.0)
-        
-        # Safely convert score to float
-        try:
-            score_val = float(score)
-        except (ValueError, TypeError):
-            score_val = 0.0
-            
-        if score_val > max_score:
-            max_score = score_val
-            
-        meta = doc.get("metadata", {})
-        doc_name = meta.get("filename", "Document")
-        page_no = meta.get("page_number", "N/A")
-        content = doc.get("content", "").strip()
-        unstructured_context.append(f"[{doc_name} - Page {page_no}]:\n{content}")
+    doc_context_str = "\n\n".join(doc_blocks).strip() if doc_blocks else ""
 
-    structured_context: List[str] = []
-    
-    # 2. Dynamic Threshold Fallback: Trigger Postgres only if ChromaDB score is too low
-    if max_score < FALLBACK_THRESHOLD:
-        print(f"[INFO] ChromaDB max score ({max_score:.4f}) is below threshold ({FALLBACK_THRESHOLD}). Triggering DB Fallback...")
-        structured_context = await sql_agent.execute_query(clean_query, llm_client, model)
-    else:
-        print(f"[INFO] ChromaDB score ({max_score:.4f}) meets threshold. Skipping DB fallback.")
-
-    # 3. Unified In-Memory Context Pool
-    all_context = unstructured_context + structured_context
-
-    if not all_context:
+    # 3. Handle Empty Context
+    if not db_context_str and not doc_context_str:
         yield json.dumps({
             "token": "I do not know based on the provided data.",
             "done": True,
             "session_id": session_id
-        })
+        }) + "\n"
         return
 
-    context_block = "\n\n---\n\n".join(all_context)
+    # 4. Assemble the Distinct Structured Context
+    context_sections = []
+    if db_context_str:
+        context_sections.append(f"=== DATABASE RECORDS (Structured Tabular Data) ===\n{db_context_str}")
+    if doc_context_str:
+        context_sections.append(f"=== DOCUMENT TEXT (Unstructured Text & PDFs) ===\n{doc_context_str}")
 
-    # 4. Synthesize Answer
+    context_block = "\n\n".join(context_sections)
+
+    print(f"\n[DEBUG FINAL CONTEXT TO LLM]:\n{context_block}\n")
+
+    # =========================================================================
+    # EVALUATION SYSTEM PROMPT: Dynamic truth-hierarchy reasoning
+    # =========================================================================
     system_instruction = (
         "You are an enterprise AI assistant strictly grounded in the provided context.\n"
-        "DIRECTIVES:\n"
-        "1. FACTUAL GROUNDING: Base your answer strictly on the facts present in <context>.\n"
-        "2. MULTI-SOURCE SYNTHESIS: If the context contains overlapping or differing information from multiple distinct sources, cleanly state the findings from both without explicitly citing file names or page numbers.\n"
-        "3. PLAIN NATURAL TEXT ONLY: Answer in direct, standard conversational sentences. NEVER output JSON, function calls, parameters, or dictionary objects. Do NOT include citation brackets or file names in the text.\n"
-        "4. NO QUESTION REPETITION: Do NOT repeat, paraphrase, or summarize the user's question.\n"
-        "5. VERBATIM METRICS: Output specific entity names, values, metrics, and identifiers exactly as presented.\n"
-        "6. UNKNOWN INFO: If the answer is not present in the context, output ONLY: 'I do not know based on the provided data.'"
+        "You will receive context from two distinct sources: DATABASE RECORDS (structured tabular data) and DOCUMENT TEXT (unstructured PDF/text data).\n\n"
+        "SOURCE EVALUATION & CONFLICT RESOLUTION:\n"
+        "1. Do not rely on specific keywords. Instead, evaluate the data provided in both sources against the user's intent.\n"
+        "2. DATABASE TRUTH: 'DATABASE RECORDS' represent the absolute system of record for structured metrics, entity relationships, and raw tabular data. If answering a question requiring data comparison or exact metrics, prioritize this source.\n"
+        "3. DOCUMENT TRUTH: 'DOCUMENT TEXT' represents the system of record for policies, guidelines, definitions, and unstructured narratives.\n"
+        "4. CONTRADICTIONS: If both sources contain data that answers the query but the numeric values or entities conflict, 'DATABASE RECORDS' strictly supersedes 'DOCUMENT TEXT'.\n\n"
+        "STRICT DIRECTIVES:\n"
+        "1. Provide extremely direct, brief answers. Get straight to the point.\n"
+        "2. NO META-TALK: Never say 'According to the database' or 'Based on the context'.\n"
+        "3. NO MARKDOWN: Output raw plain text ONLY. No asterisks (**) or hashes (#).\n"
+        "4. If neither source contains the answer, output ONLY: 'I do not know based on the provided data.'"
     )
 
     messages = [{"role": "system", "content": system_instruction}]
@@ -114,32 +130,36 @@ async def stream_chat_response(
 
     messages.append({
         "role": "user",
-        "content": (
-            f"<context>\n{context_block}\n</context>\n\n"
-            f"Question: {clean_query}\n\n"
-            "Provide the direct plain text answer:"
-        )
+        "content": f"<context>\n{context_block}\n</context>\n\nQuestion: {clean_query}\nAnswer:"
     })
 
+    # =========================================================================
+    # STREAMING GENERATION
+    # =========================================================================
     full_response = ""
     try:
         response_stream = await llm_client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=1000,
             stream=True
         )
 
         async for chunk in response_stream:
+            # Azure OpenAI sometimes returns empty choices arrays on the first/last chunk
+            if not chunk.choices:
+                continue
+                
             token = chunk.choices[0].delta.content or ""
             if token:
                 full_response += token
                 yield json.dumps({"token": token, "done": False, "session_id": session_id}) + "\n"
 
-        SESSION_STORE[session_id]["messages"].append({"role": "user", "content": clean_query})
-        SESSION_STORE[session_id]["messages"].append({"role": "assistant", "content": full_response})
-
+        SESSION_STORE[session_id]["messages"].extend([
+            {"role": "user", "content": clean_query},
+            {"role": "assistant", "content": full_response}
+        ])
         yield json.dumps({"token": "", "done": True, "session_id": session_id}) + "\n"
 
     except Exception as e:

@@ -1,172 +1,309 @@
 import os
 import re
+import uuid
+import json
 import logging
-from typing import List
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+import chromadb
+from sqlalchemy import text
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
-from backend.database import SessionLocal
+# Import both SessionLocal and engine from your database setup
+from backend.database import SessionLocal, engine
 from backend.models import Document as DBDocument, Page
 
-# Load environment variables from .env file
+# Initialize Environment and Logging
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-
-# --- DYNAMIC CONFIGURATION (NO HARDCODING) ---
+# Configuration Variables
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", os.path.join(os.getcwd(), "chroma_db"))
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "enterprise_knowledge_base")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 600))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 100))
+BATCH_SIZE = 500  # Safe batch size to prevent Out-Of-Memory (OOM) errors
 
 
-def is_heading(line: str) -> bool:
-    """Detects if a single line acts as a section heading or title based on structural patterns."""
-    line = line.strip()
-    if not line or len(line) > 100:
-        return False
-    is_numbered = bool(re.match(r'^(\d+(\.\d+)*|[A-Z]\.)\s+[A-Z]', line))
-    is_all_caps = line.isupper() and len(line.split()) <= 10
-    is_title_case = bool(re.match(r'^[A-Z][a-zA-Z0-9\s,&/\-]{2,40}$', line)) and len(line.split()) <= 6
-    return is_numbered or is_all_caps or is_title_case
+def get_embedding_model() -> SentenceTransformer:
+    """Returns the shared SentenceTransformer model instance."""
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
-def create_semantic_chunks(page_text: str, tables: list, metadata_base: dict) -> List[Document]:
-    """Splits page text and tables while injecting hierarchical document and section context dynamically."""
-    chunks = []
+def get_vector_store():
+    """Returns the native ChromaDB collection instance."""
+    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    return client.get_or_create_collection(name=COLLECTION_NAME)
+
+
+def robust_overlapping_chunker(text: str, max_words: int = 600, overlap_words: int = 150) -> list:
+    """
+    Header-Aware Sliding Window Chunker:
+    1. Identifies headers (short lines without ending punctuation) and emphasizes them.
+    2. Groups text into max 600-word chunks.
+    3. Uses a 150-word overlap for the next chunk so context is never lost.
+    4. Respects sentence boundaries (never splits a sentence in half).
+    """
+    if not text:
+        return []
+
+    # 1. SPLIT BY RAW LINES (To preserve header structure before cleaning spaces)
+    raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
     
-    # Text splitter driven by dynamic environment variables
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        length_function=len,
-        separators=["\n\n", "\n", ". ", "? ", "! ", " ", ""]
-    )
-    
-    doc_name = metadata_base.get("filename", "Unknown Document").replace(".pdf", "").replace("_", " ")
-    current_section = "General Overview"
-    section_buffer = []
+    semantic_units = [] # Will store either a [HEADER] or a full complete sentence
+    current_sentence_buffer = ""
 
-    # 1. Process Text with Context Enrichment
-    if page_text:
-        lines = page_text.split('\n')
-        for line in lines:
-            if is_heading(line):
-                if section_buffer:
-                    full_text = "\n".join(section_buffer)
-                    for idx, txt in enumerate(text_splitter.split_text(full_text)):
-                        enriched_text = f"Document: {doc_name}\nSection: {current_section}\n\n{txt}"
-                        meta = {**metadata_base, "section": current_section, "type": "text", "sub_index": idx}
-                        chunks.append(Document(page_content=enriched_text, metadata=meta))
-                    section_buffer = []
-                current_section = line.strip()
-            else:
-                section_buffer.append(line)
+    for line in raw_lines:
+        # Heuristic to detect a Header: 
+        # - Short length (<= 12 words)
+        # - Does not end with sentence punctuation (. ! ?)
+        # - Is not a bullet point (-, *, •)
+        is_header = (
+            len(line.split()) <= 12 
+            and not line[-1] in '.!?' 
+            and not line.startswith(('-', '*', '•'))
+        )
 
-        if section_buffer:
-            full_text = "\n".join(section_buffer)
-            for idx, txt in enumerate(text_splitter.split_text(full_text)):
-                enriched_text = f"Document: {doc_name}\nSection: {current_section}\n\n{txt}"
-                meta = {**metadata_base, "section": current_section, "type": "text", "sub_index": idx}
-                chunks.append(Document(page_content=enriched_text, metadata=meta))
-
-    # 2. Process Tables with Heading Context
-    if tables:
-        for t_idx, table in enumerate(tables):
-            if not table or len(table) < 1:
-                continue
-            headers = " | ".join(table[0])
-            rows = [" | ".join(row) for row in table[1:]]
-            table_markdown = (
-                f"Document: {doc_name}\nSection: {current_section}\n"
-                f"Table {t_idx + 1}:\n| {headers} |\n| " + " | ".join(["---"] * len(table[0])) + " |\n"
-            )
-            table_markdown += "\n".join([f"| {r} |" for r in rows])
+        if is_header:
+            # If we were building a sentence, save it first before adding the header
+            if current_sentence_buffer:
+                # Split any multiple sentences inside the buffer safely
+                for s in re.split(r'(?<=[.!?])\s+', current_sentence_buffer.strip()):
+                    if s.strip(): semantic_units.append(s.strip())
+                current_sentence_buffer = ""
             
-            meta = {**metadata_base, "section": current_section, "type": "table", "table_index": t_idx}
-            chunks.append(Document(page_content=table_markdown, metadata=meta))
+            # Make the header stand out for the LLM
+            semantic_units.append(f"\n[{line.upper()}]")
+        else:
+            # It's normal text. Add to our sentence buffer.
+            current_sentence_buffer += (" " if current_sentence_buffer else "") + line
+            
+            # If the buffer now ends with punctuation, it's a complete sentence. Save it.
+            if current_sentence_buffer[-1] in '.!?':
+                for s in re.split(r'(?<=[.!?])\s+', current_sentence_buffer.strip()):
+                    if s.strip(): semantic_units.append(s.strip())
+                current_sentence_buffer = ""
+
+    # Flush any remaining text in the buffer
+    if current_sentence_buffer:
+        for s in re.split(r'(?<=[.!?])\s+', current_sentence_buffer.strip()):
+            if s.strip(): semantic_units.append(s.strip())
+
+    if not semantic_units:
+        return []
+
+    # 2. OVERLAPPING CHUNK LOGIC (600 Max Words, 150 Overlap)
+    chunks = []
+    current_chunk = []
+    current_word_count = 0
+
+    i = 0
+    while i < len(semantic_units):
+        unit = semantic_units[i]
+        unit_word_count = len(unit.split())
+
+        # If adding this unit exceeds our max word limit
+        if current_word_count + unit_word_count > max_words and current_chunk:
+            # Save the completed chunk
+            chunks.append(" ".join(current_chunk).strip())
+            
+            # Create overlap for the next chunk (going back ~150 words)
+            overlap_chunk = []
+            overlap_count = 0
+            
+            for u in reversed(current_chunk):
+                u_len = len(u.split())
+                if overlap_count + u_len <= overlap_words:
+                    overlap_chunk.insert(0, u)
+                    overlap_count += u_len
+                else:
+                    if not overlap_chunk: # Ensure at least one unit overlaps
+                        overlap_chunk.insert(0, u)
+                        overlap_count += u_len
+                    break
+            
+            current_chunk = overlap_chunk
+            current_word_count = overlap_count
+            
+        current_chunk.append(unit)
+        current_word_count += unit_word_count
+        i += 1
+
+    # Append any remaining units as the final chunk
+    if current_chunk:
+        chunks.append(" ".join(current_chunk).strip())
 
     return chunks
 
 
-def get_embedding_model() -> HuggingFaceEmbeddings:
-    """Initializes and returns the Hugging Face embedding model based on env variables."""
-    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-
-
-def get_vector_store(embeddings: HuggingFaceEmbeddings = None) -> Chroma:
-    """Returns the Chroma vector store instance connected to the dynamic path."""
-    if embeddings is None:
-        embeddings = get_embedding_model()
-    return Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=embeddings,
-        persist_directory=CHROMA_PERSIST_DIR
-    )
-
-
-def build_vector_store():
-    """Reads processed data from SQL, applies context-enriched chunking, and persists vectors."""
+def process_and_embed_everything():
+    """
+    Extracts text and tables from PostgreSQL (PDF pages & CSV tables), applies robust 
+    chunking/formatting, and embeds everything into ChromaDB using memory-safe batching.
+    """
     db = SessionLocal()
-    try:
-        logging.info(f"Initializing Hugging Face model: {EMBEDDING_MODEL_NAME}...")
-        embeddings = get_embedding_model()
-        vector_store = get_vector_store(embeddings)
 
-        # Clear previous vector collection to avoid stale chunks
+    try:
+        logging.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
+        model = get_embedding_model()
+        chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+
+        # Clear existing collection to avoid duplicated data upon re-running
         try:
-            logging.info("Resetting existing ChromaDB collection...")
-            vector_store.delete_collection()
-            vector_store = get_vector_store(embeddings)
+            chroma_client.delete_collection(name=COLLECTION_NAME)
+            logging.info("Existing ChromaDB collection cleared.")
         except Exception:
             pass
 
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+
+        all_texts = []
+        all_metadatas = []
+        all_ids = []
+
+        # ==========================================
+        # PHASE 1: FETCH AND PROCESS PDF DOCUMENTS
+        # ==========================================
+        logging.info("Extracting PDF documents from PostgreSQL 'pages' table...")
         docs = db.query(DBDocument).filter(
-            DBDocument.file_type == 'pdf', 
-            DBDocument.status == 'completed'
+            DBDocument.file_type == "pdf",
+            DBDocument.status == "completed"
         ).all()
 
-        if not docs:
-            logging.warning("No completed PDF documents found in database to chunk.")
-            return
-
-        all_documents: List[Document] = []
-
         for doc in docs:
-            logging.info(f"Processing structure-aware chunks for: {doc.filename}")
-            pages = db.query(Page).filter(Page.document_id == doc.id).order_by(Page.page_number.asc()).all()
+            logging.info(f"Processing PDF: {doc.filename}")
+            pages = db.query(Page).filter(Page.document_id == doc.id).order_by(Page.page_number).all()
 
             for page in pages:
+                # 1. Safely parse JSON content
                 content = page.content or {}
-                text = content.get("text", "")
+                if isinstance(content, str):
+                    try:
+                        content = json.loads(content)
+                    except Exception:
+                        content = {}
+                
+                # Extract Text and Tables independently
+                raw_text = content.get("text", "")
                 tables = content.get("tables", [])
+                
+                # -------------------------------------------------
+                # STEP A: PROCESS PDF TEXT WITH OVERLAPPING CHUNKER
+                # -------------------------------------------------
+                chunks = robust_overlapping_chunker(raw_text, max_words=600, overlap_words=150)
 
-                base_meta = {
-                    "document_id": str(doc.id),
-                    "filename": doc.filename,
-                    "page_number": page.page_number
-                }
+                for idx, chunk in enumerate(chunks):
+                    context_header = f"Source Document: {doc.filename} (Page {page.page_number})"
+                    final_chunk_text = f"{context_header}\n\n{chunk}"
+                    
+                    all_texts.append(final_chunk_text)
+                    all_metadatas.append({
+                        "filename": doc.filename,
+                        "type": "pdf_text",
+                        "page_number": int(page.page_number),
+                        "chunk_index": idx
+                    })
+                    all_ids.append(str(uuid.uuid4()))
 
-                page_chunks = create_semantic_chunks(text, tables, base_meta)
-                all_documents.extend(page_chunks)
+                # -------------------------------------------------
+                # STEP B: PROCESS PDF TABLES (Row by Row)
+                # -------------------------------------------------
+                if tables:
+                    for table_idx, table in enumerate(tables):
+                        if not table or len(table) < 2:
+                            continue # Skip empty tables or tables without data rows
+                        
+                        # Assume the first row contains the headers
+                        headers = table[0]
+                        
+                        # Loop through the remaining rows and map them to headers
+                        for row_idx, row in enumerate(table[1:]):
+                            # Zip headers and row data together safely
+                            row_dict = dict(zip(headers, row))
+                            
+                            # Format as Semantic Key-Value pairs (e.g., "Domain: Programming | Technologies: Python")
+                            formatted_row = " | ".join([f"{str(k).strip()}: {str(v).strip()}" for k, v in row_dict.items() if k and v])
+                            
+                            table_chunk_text = (
+                                f"Source Document: {doc.filename} (Page {page.page_number})\n"
+                                f"Table Data (Row {row_idx + 1}): {formatted_row}"
+                            )
+                            
+                            all_texts.append(table_chunk_text)
+                            all_metadatas.append({
+                                "filename": doc.filename,
+                                "type": "pdf_table_row",
+                                "page_number": int(page.page_number),
+                                "table_index": table_idx,
+                                "row_index": row_idx
+                            })
+                            all_ids.append(str(uuid.uuid4()))
 
-        if all_documents:
-            logging.info(f"Adding {len(all_documents)} semantic chunks to ChromaDB at {CHROMA_PERSIST_DIR}...")
-            vector_store.add_documents(documents=all_documents)
-            logging.info("Embedding & storage process completed successfully!")
+        # ==========================================
+        # PHASE 2: FETCH AND FORMAT CSV TABLES
+        # ==========================================
+        logging.info("Scanning PostgreSQL for dynamic CSV Tables...")
+        with engine.connect() as conn:
+            # Query the information schema to find all dynamic CSV tables
+            tables_res = conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'csv_data_%';"))
+            csv_tables = [row[0] for row in tables_res]
+
+            for table in csv_tables:
+                logging.info(f"Extracting Database Table: {table}")
+                rows_res = conn.execute(text(f'SELECT * FROM "{table}";'))
+                rows = rows_res.fetchall()
+                columns = list(rows_res.keys())
+
+                for row_idx, row in enumerate(rows):
+                    # Convert row to dictionary
+                    row_dict = dict(zip(columns, row))
+                    
+                    # Convert row properties into a readable semantic string
+                    row_text = " | ".join([f"{col}: {val}" for col, val in row_dict.items() if val is not None])
+                    final_chunk_text = f"Dataset: {table}\nRow Record: {row_text}"
+                    
+                    # CSV rows are usually small, so we don't need to pass them through the chunker
+                    all_texts.append(final_chunk_text)
+                    all_metadatas.append({
+                        "filename": table,
+                        "type": "csv_row",
+                        "row_index": row_idx
+                    })
+                    all_ids.append(str(uuid.uuid4()))
+
+        # ==========================================
+        # PHASE 3: BATCH EMBEDDING AND STORAGE
+        # ==========================================
+        total_chunks = len(all_texts)
+        if total_chunks > 0:
+            logging.info(f"Ready to embed {total_chunks} total chunks. Starting batch processing...")
+            
+            # Process in batches to prevent Out-Of-Memory (OOM) errors
+            for i in range(0, total_chunks, BATCH_SIZE):
+                batch_texts = all_texts[i : i + BATCH_SIZE]
+                batch_metadatas = all_metadatas[i : i + BATCH_SIZE]
+                batch_ids = all_ids[i : i + BATCH_SIZE]
+                
+                logging.info(f"Embedding batch {i // BATCH_SIZE + 1} ({len(batch_texts)} chunks)...")
+                
+                # Generate embeddings for the current batch
+                batch_embeddings = model.encode(batch_texts, show_progress_bar=False).tolist()
+
+                # Insert batch into ChromaDB
+                collection.add(
+                    documents=batch_texts,
+                    embeddings=batch_embeddings,
+                    metadatas=batch_metadatas,
+                    ids=batch_ids
+                )
+                
+            logging.info("✅ Success! All data (Text + PDF Tables + CSVs) is properly chunked, embedded, and saved to ChromaDB.")
         else:
-            logging.warning("No chunks generated from documents.")
+            logging.warning("⚠️ No text or CSV data found in the database to embed.")
 
     except Exception as e:
-        logging.error(f"Error during chunking and vector storage: {e}")
-        raise e
+        logging.error(f"❌ Pipeline Execution Error: {e}")
     finally:
         db.close()
 
 
 if __name__ == "__main__":
-    build_vector_store()
+    process_and_embed_everything()
