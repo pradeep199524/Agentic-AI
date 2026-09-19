@@ -27,6 +27,14 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               Upload Data (PDF/CSV)
             </Link>
 
+            {/* --- NEW: Chunking & Embedding Link --- */}
+            <Link
+              href="/embedding"
+              className="flex items-center gap-3 px-3 py-2.5 rounded text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
+            >
+              Data Chunking & Embedding
+            </Link>
+
             <Link
               href="/retrieval"
               className="flex items-center gap-3 px-3 py-2.5 rounded text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
@@ -34,12 +42,22 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               Retrieval Engine
             </Link>
 
+            <div className="my-2 border-t border-slate-700"></div>
+
             {/* --- AI Chatbot Link --- */}
             <Link
               href="/chat"
               className="flex items-center gap-3 px-3 py-2.5 rounded text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
             >
               AI Assistant Chat
+            </Link>
+
+            {/* --- NEW: Agentic Workflow Link --- */}
+            <Link
+              href="/agent"
+              className="flex items-center gap-3 px-3 py-2.5 rounded text-blue-400 bg-blue-900/20 hover:bg-slate-800 hover:text-blue-300 transition-colors border border-blue-900/50"
+            >
+              Agentic Workflow (Mod 6)
             </Link>
           </nav>
         </aside>

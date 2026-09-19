@@ -12,7 +12,11 @@ from backend.models import Document, Page
 from backend.services.pipeline import process_pdf, process_csv
 from backend.routers.retrieval import router as retrieval_router
 from backend.routers import chat
+from backend.routers.agent import router as agent_router
+import chromadb
 
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", os.path.join(os.getcwd(), "chroma_db"))
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "enterprise_knowledge_base")
 # ==========================================
 # 1. SETUP & LOGGING WITH CORRELATION IDs
 # ==========================================
@@ -39,6 +43,7 @@ app = FastAPI(
 )
 app.include_router(retrieval_router)
 app.include_router(chat.router)
+app.include_router(agent_router)
 
 # CORS Configuration for Next.js Frontend
 app.add_middleware(
@@ -281,24 +286,42 @@ def get_csv_records(table_name: str, db: Session = Depends(get_db)):
 
 @app.delete("/documents/{doc_id}", summary="Delete document and related resources")
 def delete_document(doc_id: int, db: Session = Depends(get_db)):
-    """Deletes the document from PostgreSQL, drops CSV tables if applicable, and removes the local file."""
+    """Deletes the document from PostgreSQL, drops CSV tables, deletes ChromaDB embeddings, and removes the local file."""
     doc = db.query(Document).filter(Document.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
-    # Aggressively clean up file on manual delete too
+    # 1. Aggressively clean up local files
     clean_orphaned_files("data", doc.filename)
             
-    # Drop dynamic CSV table if applicable
+    # 2. Drop dynamic CSV table if applicable
+    table_name = None
     if doc.file_type == "csv":
-        table_name = f"csv_data_{doc.filename.split('.')[0].lower()}"
+        base_name = doc.filename.rsplit('.', 1)[0].lower().replace(" ", "_").replace("-", "_")
+        table_name = f"csv_data_{base_name}"
         try:
-            db.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+            db.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
         except Exception as e:
             logger.error(f"Failed to drop SQL table {table_name}: {e}")
             
-    # Delete Document record (Pages are automatically removed via cascade)
+    # 3. Surgically delete embeddings from ChromaDB
+    try:
+        chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        
+        # Target the filename used in the vector metadata
+        targets = [doc.filename]
+        if table_name:
+            targets.append(table_name)
+            
+        for target in targets:
+            collection.delete(where={"filename": target})
+            logger.info(f"Purged ChromaDB embeddings for: {target}")
+    except Exception as e:
+        logger.warning(f"Could not purge ChromaDB embeddings for {doc.filename}: {e}")
+
+    # 4. Delete Document record from PostgreSQL (Pages cascade automatically)
     db.delete(doc)
     db.commit()
     
-    return {"message": f"Document '{doc.filename}' and associated data successfully deleted."}
+    return {"message": f"Document '{doc.filename}' and all associated database/vector records successfully deleted."}

@@ -3,6 +3,7 @@ import re
 import uuid
 import json
 import logging
+import argparse
 import chromadb
 import tiktoken
 from sqlalchemy import text
@@ -40,10 +41,75 @@ def count_tokens(text: str) -> int:
     """Returns the exact number of LLM tokens in a string."""
     return len(tokenizer.encode(text))
 
+
+# =========================================================================
+# CHUNKING STRATEGY 1: FIXED (Rigid Token/Character Limits)
+# =========================================================================
+def fixed_size_chunker(text: str, chunk_size: int = 500, overlap: int = 50) -> list:
+    """Splits text rigidly by an exact token count, with a slight overlap to prevent cutting words."""
+    if not text:
+        return []
+    
+    tokens = tokenizer.encode(text)
+    chunks = []
+    
+    for i in range(0, len(tokens), chunk_size - overlap):
+        chunk_tokens = tokens[i : i + chunk_size]
+        chunks.append(tokenizer.decode(chunk_tokens).strip())
+        
+    return chunks
+
+
+# =========================================================================
+# CHUNKING STRATEGY 2: STRUCTURE-AWARE (Headings, Sections & Token Limits)
+# =========================================================================
+def structure_aware_chunker(text: str, max_tokens: int = 500) -> list:
+    """
+    Splits text along structural document boundaries (Headings, Sections, Paragraphs)
+    and enforces strict token limits using tiktoken to prevent model truncation.
+    """
+    if not text:
+        return []
+
+    # Regex matches Markdown headers (# H1, ## H2), 'Section X', or double newlines
+    section_pattern = r'(?=(\n#{1,6}\s+[^\n]+|\n(?:Section|\bPart|\bChapter)\s+[0-9IVXLCDM]+[^\n]*|\n\s*\n))'
+    raw_sections = re.split(section_pattern, text.strip(), flags=re.IGNORECASE)
+    
+    sections = [s.strip() for s in raw_sections if s and s.strip()]
+
+    final_chunks = []
+    current_chunk = ""
+
+    for section in sections:
+        section_tokens = count_tokens(section)
+
+        # If a single section is larger than max_tokens, split it with fixed token chunker
+        if section_tokens > max_tokens:
+            if current_chunk:
+                final_chunks.append(current_chunk.strip())
+                current_chunk = ""
+            final_chunks.extend(fixed_size_chunker(section, chunk_size=max_tokens, overlap=50))
+            continue
+
+        # If adding the section exceeds the limit, push current and start new
+        if count_tokens(current_chunk + "\n\n" + section) > max_tokens:
+            if current_chunk:
+                final_chunks.append(current_chunk.strip())
+            current_chunk = section
+        else:
+            current_chunk = f"{current_chunk}\n\n{section}".strip()
+
+    if current_chunk:
+        final_chunks.append(current_chunk.strip())
+
+    return final_chunks
+
+
+# =========================================================================
+# CHUNKING STRATEGY 3: SEMANTIC (Meaning-based similarity)
+# =========================================================================
 def true_semantic_chunker(text: str, embedding_model, max_tokens: int = 500, similarity_threshold: float = 0.45) -> list:
-    """
-    Splits text when the semantic topic changes, while strictly enforcing token limits.
-    """
+    """Splits text when the semantic topic changes, while strictly enforcing token limits."""
     if not text:
         return []
 
@@ -87,26 +153,45 @@ def true_semantic_chunker(text: str, embedding_model, max_tokens: int = 500, sim
 
     return chunks
 
-def process_and_embed_everything():
+
+# =========================================================================
+# MAIN PIPELINE
+# =========================================================================
+def process_and_embed_everything(chunking_strategy: str = "semantic", target_filenames: list = None):
     """
-    Extracts text and tables from PostgreSQL, applies TRUE SEMANTIC chunking, 
-    and embeds everything into ChromaDB using memory-safe batching.
+    Extracts text and tables from PostgreSQL, applies the user-selected chunking strategy, 
+    and embeds everything into ChromaDB. Supports targeted embedding for specific files.
     """
     db = SessionLocal()
 
     try:
         logging.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
+        logging.info(f"Using text chunking strategy: {chunking_strategy.upper()}")
         model = get_embedding_model()
         chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 
-        # Clear existing collection to avoid duplicated data upon re-running
-        try:
-            chroma_client.delete_collection(name=COLLECTION_NAME)
-            logging.info("Existing ChromaDB collection cleared.")
-        except Exception:
-            pass
-
+        # -------------------------------------------------------------
+        # STEP 1: Handle Database Wiping OR Targeted Deletion
+        # -------------------------------------------------------------
         collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        
+        if target_filenames and len(target_filenames) > 0:
+            logging.info(f"Targeted embedding mode activated for: {target_filenames}")
+            # Surgically remove old embeddings for ONLY the selected files
+            for fname in target_filenames:
+                try:
+                    collection.delete(where={"filename": fname})
+                    logging.info(f"Cleared old ChromaDB embeddings for: {fname}")
+                except Exception as e:
+                    logging.warning(f"Could not delete old embeddings for {fname}: {e}")
+        else:
+            # If no files selected, we do a full wipe and rebuild
+            try:
+                chroma_client.delete_collection(name=COLLECTION_NAME)
+                logging.info("Existing ChromaDB collection cleared for full rebuild.")
+            except Exception:
+                pass
+            collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
         all_texts = []
         all_metadatas = []
@@ -116,10 +201,17 @@ def process_and_embed_everything():
         # PHASE 1: FETCH AND PROCESS PDF DOCUMENTS
         # ==========================================
         logging.info("Extracting PDF documents from PostgreSQL 'pages' table...")
-        docs = db.query(DBDocument).filter(
-            DBDocument.file_type == "pdf",
-            DBDocument.status == "completed"
-        ).all()
+        
+        # Start base query (Removed strict status filter to match frontend UI)
+        pdf_query = db.query(DBDocument).filter(
+            DBDocument.file_type == "pdf"
+        )
+        
+        # Filter query by specific files if requested
+        if target_filenames and len(target_filenames) > 0:
+            pdf_query = pdf_query.filter(DBDocument.filename.in_(target_filenames))
+            
+        docs = pdf_query.all()
 
         for doc in docs:
             logging.info(f"Processing PDF: {doc.filename}")
@@ -139,14 +231,20 @@ def process_and_embed_everything():
                 tables = content.get("tables", [])
                 
                 # -------------------------------------------------
-                # STEP A: PROCESS PDF TEXT WITH TRUE SEMANTIC CHUNKER
+                # STEP A: DYNAMIC ROUTING TO SELECTED CHUNKER
                 # -------------------------------------------------
-                chunks = true_semantic_chunker(
-                    text=raw_text, 
-                    embedding_model=model, 
-                    max_tokens=500, 
-                    similarity_threshold=0.45
-                )
+                if chunking_strategy == "fixed":
+                    chunks = fixed_size_chunker(text=raw_text, chunk_size=500, overlap=50)
+                elif chunking_strategy == "structured":
+                    # FIX: Now using the upgraded structure_aware_chunker
+                    chunks = structure_aware_chunker(text=raw_text, max_tokens=500)
+                else: # Default to Semantic
+                    chunks = true_semantic_chunker(
+                        text=raw_text, 
+                        embedding_model=model, 
+                        max_tokens=500, 
+                        similarity_threshold=0.45
+                    )
 
                 for idx, chunk in enumerate(chunks):
                     context_header = f"Source Document: {doc.filename} (Page {page.page_number})"
@@ -157,28 +255,27 @@ def process_and_embed_everything():
                         "filename": doc.filename,
                         "type": "pdf_text",
                         "page_number": int(page.page_number),
-                        "chunk_index": idx
+                        "chunk_index": idx,
+                        "strategy_used": chunking_strategy
                     })
                     all_ids.append(str(uuid.uuid4()))
 
                 # -------------------------------------------------
-                # STEP B: PROCESS PDF TABLES (Whole Table Chunking)
+                # STEP B: PROCESS PDF TABLES (Always Structured)
                 # -------------------------------------------------
                 if tables:
                     for table_idx, table in enumerate(tables):
                         if not table or len(table) < 2:
-                            continue # Skip empty tables or tables without data rows
+                            continue 
                         
                         headers = table[0]
                         table_rows_formatted = []
                         
-                        # Gather all rows into a single list
                         for row_idx, row in enumerate(table[1:]):
                             row_dict = dict(zip(headers, row))
                             formatted_row = " | ".join([f"{str(k).strip()}: {str(v).strip()}" for k, v in row_dict.items() if k and v])
                             table_rows_formatted.append(f"Row {row_idx + 1}: {formatted_row}")
                             
-                        # Join all rows together into one massive string block
                         full_table_text = "\n".join(table_rows_formatted)
                         
                         table_chunk_text = (
@@ -202,6 +299,10 @@ def process_and_embed_everything():
         with engine.connect() as conn:
             tables_res = conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'csv_data_%';"))
             csv_tables = [row[0] for row in tables_res]
+            
+            # Filter CSV tables by specific files if requested
+            if target_filenames and len(target_filenames) > 0:
+                csv_tables = [t for t in csv_tables if t in target_filenames]
 
             for table in csv_tables:
                 logging.info(f"Extracting Database Table: {table}")
@@ -209,18 +310,57 @@ def process_and_embed_everything():
                 rows = rows_res.fetchall()
                 columns = list(rows_res.keys())
 
-                for row_idx, row in enumerate(rows):
-                    row_dict = dict(zip(columns, row))
-                    row_text = " | ".join([f"{col}: {val}" for col, val in row_dict.items() if val is not None])
-                    final_chunk_text = f"Dataset: {table}\nRow Record: {row_text}"
+                # -------------------------------------------------
+                # STRATEGY 1: STRUCTURED (Row-by-Row Chunking)
+                # -------------------------------------------------
+                if chunking_strategy == "structured":
+                    for row_idx, row in enumerate(rows):
+                        row_dict = dict(zip(columns, row))
+                        row_text = " | ".join([f"{col}: {val}" for col, val in row_dict.items() if val is not None])
+                        final_chunk_text = f"Dataset: {table}\nRow Record: {row_text}"
+                        
+                        all_texts.append(final_chunk_text)
+                        all_metadatas.append({
+                            "filename": table,
+                            "type": "csv_row",
+                            "row_index": row_idx,
+                            "strategy_used": "structured"
+                        })
+                        all_ids.append(str(uuid.uuid4()))
+                        
+                # -------------------------------------------------
+                # STRATEGY 2 & 3: FIXED OR SEMANTIC CHUNKING
+                # -------------------------------------------------
+                else:
+                    # Combine all rows into a massive readable text block
+                    combined_csv_text = ""
+                    for row_idx, row in enumerate(rows):
+                        row_dict = dict(zip(columns, row))
+                        row_text = " | ".join([f"{col}: {val}" for col, val in row_dict.items() if val is not None])
+                        combined_csv_text += f"Row {row_idx + 1} - {row_text}. "
                     
-                    all_texts.append(final_chunk_text)
-                    all_metadatas.append({
-                        "filename": table,
-                        "type": "csv_row",
-                        "row_index": row_idx
-                    })
-                    all_ids.append(str(uuid.uuid4()))
+                    # Apply the chosen chunking algorithm to the combined text
+                    if chunking_strategy == "fixed":
+                        chunks = fixed_size_chunker(text=combined_csv_text, chunk_size=500, overlap=50)
+                    else: # Semantic
+                        chunks = true_semantic_chunker(
+                            text=combined_csv_text, 
+                            embedding_model=model, 
+                            max_tokens=500, 
+                            similarity_threshold=0.45
+                        )
+                        
+                    for idx, chunk in enumerate(chunks):
+                        final_chunk_text = f"Dataset: {table}\n\n{chunk}"
+                        
+                        all_texts.append(final_chunk_text)
+                        all_metadatas.append({
+                            "filename": table,
+                            "type": "csv_text_block",
+                            "chunk_index": idx,
+                            "strategy_used": chunking_strategy
+                        })
+                        all_ids.append(str(uuid.uuid4()))
 
         # ==========================================
         # PHASE 3: BATCH EMBEDDING AND STORAGE
@@ -245,14 +385,38 @@ def process_and_embed_everything():
                     ids=batch_ids
                 )
                 
-            logging.info("✅ Success! All data is properly chunked with TRUE semantics, embedded, and saved to ChromaDB.")
+            logging.info(f"✅ Success! Data chunked using [{chunking_strategy.upper()}], embedded, and saved to ChromaDB.")
         else:
-            logging.warning("⚠️ No text or CSV data found in the database to embed.")
+            logging.warning("⚠️ No text or CSV data found to embed for the selected files.")
 
     except Exception as e:
         logging.error(f"❌ Pipeline Execution Error: {e}")
+        raise e  # FIX: Re-raise the exception so FastAPI properly triggers a 500 Error in the UI
     finally:
         db.close()
 
+
 if __name__ == "__main__":
-    process_and_embed_everything()
+    # Allows the user to select the chunking technique directly from the command line!
+    parser = argparse.ArgumentParser(description="Run the RAG Data Ingestion and Embedding Pipeline.")
+    
+    parser.add_argument(
+        "--strategy", 
+        type=str, 
+        choices=["fixed", "structured", "semantic"], 
+        default="semantic",
+        help="Select the chunking technique for unstructured PDF text."
+    )
+    
+    parser.add_argument(
+        "--files", 
+        type=str, 
+        default="",
+        help="Comma-separated list of filenames to target (e.g., 'policy.pdf,csv_data_sales'). Leave blank for all."
+    )
+    
+    args = parser.parse_args()
+    
+    target_list = [f.strip() for f in args.files.split(",")] if args.files else None
+    
+    process_and_embed_everything(chunking_strategy=args.strategy, target_filenames=target_list)
